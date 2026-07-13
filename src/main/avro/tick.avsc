@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "Tick",
+  "namespace": "domain",
+  "fields": [
+    { "name": "symbol",    "type": "string" },
+    { "name": "timestamp", "type": "long"   },
+    { "name": "bid",       "type": "double" },
+    { "name": "ask",       "type": "double" },
+    { "name": "volume",    "type": "double" },
+    { "name": "spread",    "type": "double" }
+  ]
+}
