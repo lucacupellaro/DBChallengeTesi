@@ -23,6 +23,8 @@ import java.time.format.DateTimeFormatter;
  *       while ((t = r.next()) != null) { ... }
  *   }
  */
+
+//Closeable mantiene aperta una risorsa fino a quando non ha finito
 public class TickReader implements Closeable {
 
 

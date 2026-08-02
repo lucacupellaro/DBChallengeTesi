@@ -46,7 +46,33 @@ public class Executor {
                           .sorted(Comparator.comparing(Path::getFileName))
                           .collect(Collectors.toList());
             }
-            System.out.println("File trovati: " + giorni.size());
+            int trovati = giorni.size();
+
+            // 2a) finestra di INGESTIONE.
+            //     I nomi file sono YYYY-MM-DD.csv, quindi il confronto lessicografico
+            //     coincide con quello cronologico.
+            //     -DfromDate=2026-03-11  -> parte dal giorno 49 (warmup 22gg + test)
+            String fromDate = System.getProperty("fromDate", "");
+            if (!fromDate.isEmpty()) {
+                giorni = giorni.stream()
+                               .filter(p -> p.getFileName().toString().compareTo(fromDate) >= 0)
+                               .collect(Collectors.toList());
+            }
+            //     -DmaxDays=10 -> tiene solo gli ultimi N giorni (0 = nessun limite)
+            int maxDays = Integer.getInteger("maxDays", 0);
+            if (maxDays > 0 && giorni.size() > maxDays) {
+                giorni = giorni.subList(giorni.size() - maxDays, giorni.size());
+            }
+
+            if (giorni.isEmpty()) {
+                System.out.println("Nessun file da processare (trovati " + trovati
+                        + ", esclusi tutti dai filtri fromDate/maxDays).");
+                return;
+            }
+            System.out.printf("File da processare: %d/%d  (dal %s al %s)%n",
+                              giorni.size(), trovati,
+                              giorni.get(0).getFileName(),
+                              giorni.get(giorni.size() - 1).getFileName());
 
             long totale = 0;
             long start  = System.currentTimeMillis();

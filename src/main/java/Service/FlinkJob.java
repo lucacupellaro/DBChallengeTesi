@@ -2,27 +2,39 @@ package Service;
 
 import domain.DailyRV;
 import domain.FiveMinReturn;
+import domain.LogRetAcc;
+import domain.LogRetAgg;
+import domain.MlRequest;
 import domain.Prediction;
+import domain.RvAcc;
+import domain.RvAgg;
 import domain.Tick;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import org.apache.flink.api.common.accumulators.LongCounter;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.RichFilterFunction;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.formats.avro.registry.confluent.ConfluentRegistryAvroDeserializationSchema;
+import org.apache.flink.streaming.api.datastream.AsyncDataStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.async.AsyncFunction;
+import org.apache.flink.streaming.api.functions.async.ResultFuture;
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
@@ -30,15 +42,27 @@ import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 
 import java.io.BufferedReader;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 public class FlinkJob {
 
@@ -49,22 +73,93 @@ public class FlinkJob {
     private static final String ML_SERVER_URL = "http://localhost:8080/predict";
     private static final int BUFFER_SIZE = 22; // giorni di storia per RV monthly
 
+    // --- Split train/test sull'asse temporale ---
+    private static final String TEST_START_DATE = System.getProperty("testStart", "");
+    private static final long TEST_START_MILLIS =
+            TEST_START_DATE.isEmpty()
+                    ? Long.MIN_VALUE
+                    : LocalDate.parse(TEST_START_DATE)
+                               .atStartOfDay(ZoneOffset.UTC)
+                               .toInstant()
+                               .toEpochMilli();
+
     // JDBC
     private static final String JDBC_URL = "jdbc:postgresql://localhost:5433/volatility";
     private static final String JDBC_USER = "flink";
     private static final String JDBC_PASSWORD = "flink";
 
+    // --- Configurazione sperimentale ---
+    private static Properties loadConfig() {
+        Properties props = new Properties();
+        try (InputStream is = FlinkJob.class.getClassLoader()
+                .getResourceAsStream("pipeline.properties")) {
+            if (is != null) props.load(is);
+        } catch (Exception e) {
+            System.out.println("[config] pipeline.properties non trovato, uso default");
+        }
+        return props;
+    }
+
+    private static int intConf(Properties p, String key, int def) {
+        return Integer.parseInt(p.getProperty(key, String.valueOf(def)));
+    }
+
+    private static long longConf(Properties p, String key, long def) {
+        return Long.parseLong(p.getProperty(key, String.valueOf(def)));
+    }
+
+    private static boolean boolConf(Properties p, String key, boolean def) {
+        return Boolean.parseBoolean(p.getProperty(key, String.valueOf(def)));
+    }
+
+    private final int parallelismOverride;
+    private final int kafkaPartitionsOverride;
+
+    public FlinkJob() {
+        this(-1, -1);
+    }
+
+    public FlinkJob(int parallelismOverride) {
+        this(parallelismOverride, -1);
+    }
+
+    public FlinkJob(int parallelismOverride, int kafkaPartitionsOverride) {
+        this.parallelismOverride = parallelismOverride;
+        this.kafkaPartitionsOverride = kafkaPartitionsOverride;
+    }
+
     public void start() throws Exception {
+
+        Properties conf = loadConfig();
+        int parallelism = parallelismOverride > 0
+                ? parallelismOverride
+                : intConf(conf, "flink.parallelism", 12);
+        long checkpointMs     = longConf(conf, "checkpoint.interval.ms", 60000);
+        boolean mlEnabled     = boolConf(conf, "ml.enabled", true);
+        int mlAsyncCapacity   = intConf(conf, "ml.async.capacity", 20);
+        int mlAsyncTimeoutS   = intConf(conf, "ml.async.timeout.s", 30);
+        int sinkParallelism   = intConf(conf, "sink.jdbc.parallelism", 4);
+
+        System.out.printf("[config] parallelism=%d  checkpoint=%dms  ml.enabled=%s  " +
+                "ml.async.capacity=%d  sink.parallelism=%d%n",
+                parallelism, checkpointMs, mlEnabled, mlAsyncCapacity, sinkParallelism);
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-        // --- Checkpointing: snapshot dello stato ogni 60s ---
-        env.enableCheckpointing(60000);
+        env.enableCheckpointing(checkpointMs);
         env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
-        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30000);
-        env.getCheckpointConfig().setCheckpointTimeout(120000);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(checkpointMs / 2);
+        env.getCheckpointConfig().setCheckpointTimeout(checkpointMs * 2);
         env.getCheckpointConfig().setExternalizedCheckpointCleanup(
                 CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+        env.setParallelism(parallelism);
+
+        if (TEST_START_DATE.isEmpty()) {
+            System.out.println("[split] nessun gate di warmup: inferenze su tutti i giorni ingeriti");
+        } else {
+            System.out.println("[split] inferenze emesse dal " + TEST_START_DATE
+                    + " in poi; i giorni precedenti riempiono il buffer senza inferire");
+        }
 
         // --- Kafka source ---
         KafkaSource<Tick> kafkaSource = KafkaSource.<Tick>builder()
@@ -85,68 +180,72 @@ public class FlinkJob {
         DataStream<Tick> tickStream = env.fromSource(
                 kafkaSource, watermarkStrategy, "kafka-ticks-source");
 
-        // --- Filtro tick invalidi ---
-        DataStream<Tick> cleanStream = tickStream.filter(tick ->
-                tick.getTimestamp() > 0
-                && tick.getBid() > 0
-                && tick.getAsk() > 0
-                && tick.getAsk() >= tick.getBid()
-                && tick.getVolume() >= 0
-        ).name("filter-invalid-ticks");
+        // --- Filtro tick invalidi + contatore per benchmark ---
+        DataStream<Tick> cleanStream = tickStream.filter(new RichFilterFunction<Tick>() {
+            private LongCounter tickCounter = new LongCounter();
 
-        // DEBUG
-        cleanStream.map(t -> "TICK: " + t.getSymbol() + " ts=" + t.getTimestamp() + " bid=" + t.getBid()).print();
+            @Override
+            public void open(Configuration parameters) {
+                getRuntimeContext().addAccumulator("tick-counter", tickCounter);
+            }
+
+            @Override
+            public boolean filter(Tick tick) {
+                tickCounter.add(1L);
+                return tick.getTimestamp() > 0
+                        && tick.getBid() > 0
+                        && tick.getAsk() > 0
+                        && tick.getAsk() >= tick.getBid()
+                        && tick.getVolume() >= 0;
+            }
+        }).name("filter-invalid-ticks");
 
         // --- Finestra 5 minuti: tick -> 5-min log-return ---
+        // Stato costante (40 byte) invece del buffer di tutti i tick della finestra:
+        // servono solo gli estremi, per l'identita' telescopica dei log-return.
         DataStream<FiveMinReturn> fiveMinReturns = cleanStream
                 .keyBy(tick -> tick.getSymbol().toString())
                 .window(TumblingEventTimeWindows.of(Time.minutes(5)))
-                .process(new ProcessWindowFunction<Tick, FiveMinReturn, String, TimeWindow>() {
-                    @Override
-                    public void process(String symbol, Context ctx,
-                                        Iterable<Tick> ticks, Collector<FiveMinReturn> out) {
-                        List<Tick> sorted = new ArrayList<>();
-                        ticks.forEach(sorted::add);
-                        sorted.sort(Comparator.comparingLong(Tick::getTimestamp));
+                .aggregate(new LogRetAgg(),
+                        new ProcessWindowFunction<LogRetAcc, FiveMinReturn, String, TimeWindow>() {
+                            @Override
+                            public void process(String symbol, Context ctx,
+                                                Iterable<LogRetAcc> accs,
+                                                Collector<FiveMinReturn> out) {
+                                // l'Iterable contiene un solo elemento: il risultato dell'accumulatore
+                                LogRetAcc acc = accs.iterator().next();
+                                if (acc.count < 2) return;
 
-                        if (sorted.size() < 2) return;
-
-                        double firstBid = sorted.get(0).getBid();
-                        double lastBid = sorted.get(sorted.size() - 1).getBid();
-                        double logReturn = Math.log(lastBid / firstBid);
-
-                        out.collect(new FiveMinReturn(
-                                symbol, ctx.window().getEnd(), logReturn));
-                    }
-                }).name("5min-log-return");
+                                out.collect(new FiveMinReturn(
+                                        symbol, ctx.window().getEnd(),
+                                        Math.log(acc.bidAtMax / acc.bidAtMin)));
+                            }
+                        }).name("5min-log-return");
 
         // --- Finestra giornaliera: 5-min returns -> RV daily ---
-        // t0: timbriamo il wall-clock di emissione della finestra
+        // Somma corrente (12 byte) invece del buffer dei ~96 return del giorno:
+        // ogni return contribuisce a sumSquared e viene dimenticato.
         DataStream<DailyRV> dailyRV = fiveMinReturns
                 .keyBy(FiveMinReturn::getSymbol)
                 .window(TumblingEventTimeWindows.of(Time.days(1)))
-                .process(new ProcessWindowFunction<FiveMinReturn, DailyRV, String, TimeWindow>() {
-                    @Override
-                    public void process(String symbol, Context ctx,
-                                        Iterable<FiveMinReturn> returns, Collector<DailyRV> out) {
-                        double sumSquared = 0.0;
-                        int count = 0;
-                        for (FiveMinReturn r : returns) {
-                            sumSquared += r.getLogReturn() * r.getLogReturn();
-                            count++;
-                        }
-                        if (count == 0) return;
+                .aggregate(new RvAgg(),
+                        new ProcessWindowFunction<RvAcc, DailyRV, String, TimeWindow>() {
+                            @Override
+                            public void process(String symbol, Context ctx,
+                                                Iterable<RvAcc> accs,
+                                                Collector<DailyRV> out) {
+                                RvAcc acc = accs.iterator().next();
+                                if (acc.count == 0) return;
 
-                        out.collect(new DailyRV(
-                                symbol, ctx.window().getEnd(), sumSquared,
-                                System.currentTimeMillis()));  // t0: window emit wall-clock
-                    }
-                }).name("daily-rv");
+                                out.collect(new DailyRV(
+                                        symbol, ctx.window().getEnd(), acc.sumSquared));
+                            }
+                        }).name("daily-rv");
 
-        // --- Buffer 22 giorni + calcolo RV weekly/monthly + invio ML ---
-        DataStream<Prediction> predictions = dailyRV
+        // --- Buffer 22 giorni + calcolo RV weekly/monthly (niente I/O) ---
+        DataStream<MlRequest> mlRequests = dailyRV
                 .keyBy(DailyRV::getSymbol)
-                .process(new KeyedProcessFunction<String, DailyRV, Prediction>() {
+                .process(new KeyedProcessFunction<String, DailyRV, MlRequest>() {
 
                     private transient ListState<DailyRV> buffer;
                     private transient ValueState<Boolean> warmupSent;
@@ -162,10 +261,7 @@ public class FlinkJob {
 
                     @Override
                     public void processElement(DailyRV rv, Context ctx,
-                                               Collector<Prediction> out) throws Exception {
-                        // t1: buffer-and-predict riceve il record
-                        long t1PredictReceive = System.currentTimeMillis();
-
+                                               Collector<MlRequest> out) throws Exception {
                         buffer.add(rv);
 
                         List<DailyRV> history = new ArrayList<>();
@@ -179,34 +275,37 @@ public class FlinkJob {
                             buffer.update(history);
                         }
 
-                        if (history.size() < BUFFER_SIZE) return; // servono 22 giorni per RV monthly
+                        if (history.size() < BUFFER_SIZE) return;
+
+                        // --- Gate di warmup ---
+                        // Nei giorni precedenti al test il buffer si riempie ma NON si
+                        // chiama il modello: nessuna richiesta HTTP, nessuna predizione.
+                        // rv.getTimestamp() e' la FINE della finestra giornaliera, cioe'
+                        // la mezzanotte del giorno successivo: serve '<=' per escludere
+                        // il giorno che termina esattamente all'inizio del test.
+                        if (rv.getTimestamp() <= TEST_START_MILLIS) return;
 
                         double rvDaily = history.get(history.size() - 1).getRvDaily();
 
-                        // RV weekly: media ultimi 5 giorni
                         double rvWeekly = history.subList(
                                 history.size() - 5, history.size())
                                 .stream()
                                 .mapToDouble(DailyRV::getRvDaily)
                                 .average().orElse(0);
 
-                        // RV monthly: media ultimi 22 giorni (o quanti disponibili)
                         double rvMonthly = history.stream()
                                 .mapToDouble(DailyRV::getRvDaily)
                                 .average().orElse(0);
 
-                        // Salta se valori non validi
                         if (Double.isNaN(rvDaily) || Double.isInfinite(rvDaily)) return;
 
-                        // Invio al server ML
+                        // Costruisci il JSON da mandare al ML server
                         boolean isFirstCall = warmupSent.value() == null || !warmupSent.value();
                         String json;
                         if (isFirstCall) {
-                            // Warmup: manda tutta la storia di 22 giorni
                             StringBuilder historyJson = new StringBuilder("[");
                             for (int i = 0; i < history.size(); i++) {
                                 DailyRV h = history.get(i);
-                                // Calcola rv_weekly e rv_monthly per ogni giorno della storia
                                 double hRvD = h.getRvDaily();
                                 double hRvW = history.subList(Math.max(0, i + 1 - 5), i + 1)
                                         .stream().mapToDouble(DailyRV::getRvDaily).average().orElse(0);
@@ -227,123 +326,141 @@ public class FlinkJob {
                                     ctx.getCurrentKey(), rvDaily, rvWeekly, rvMonthly);
                         }
 
-                        URL url = new URL(ML_SERVER_URL);
-                        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                        conn.setRequestMethod("POST");
-                        conn.setRequestProperty("Content-Type", "application/json");
-                        conn.setDoOutput(true);
-
-                        try (OutputStream os = conn.getOutputStream()) {
-                            os.write(json.getBytes(StandardCharsets.UTF_8));
-                        }
-
-                        int code = conn.getResponseCode();
-                        if (code != 200) {
-                            BufferedReader err = new BufferedReader(
-                                    new InputStreamReader(conn.getErrorStream(), StandardCharsets.UTF_8));
-                            StringBuilder errMsg = new StringBuilder();
-                            String l;
-                            while ((l = err.readLine()) != null) errMsg.append(l);
-                            err.close();
-                            conn.disconnect();
-                            return;
-                        }
-
-                        StringBuilder sb = new StringBuilder();
-                        try (BufferedReader br = new BufferedReader(
-                                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                            String line;
-                            while ((line = br.readLine()) != null) sb.append(line);
-                        }
-                        conn.disconnect();
-
-                        // Parse JSON response
-                        JsonObject resp = JsonParser.parseString(sb.toString()).getAsJsonObject();
-                        Double mambaPred = resp.get("mamba").isJsonNull() ? null : resp.get("mamba").getAsDouble();
-                        Double lstmPred = resp.get("lstm").isJsonNull() ? null : resp.get("lstm").getAsDouble();
-                        double harPred = resp.get("har").getAsDouble();
-
-                        Prediction pred = new Prediction(
+                        out.collect(new MlRequest(
                                 ctx.getCurrentKey(), rv.getTimestamp(),
-                                rvDaily, rvWeekly, rvMonthly,
-                                mambaPred, lstmPred, harPred);
-
-                        // Propaga i timestamp di latenza
-                        pred.setWindowEmitWallClock(rv.getWindowEmitWallClock());
-                        pred.setPredictCompleteWallClock(t1PredictReceive);
-
-                        out.collect(pred);
+                                rvDaily, rvWeekly, rvMonthly, json));
                     }
-                }).name("buffer-and-predict");
+                }).name("buffer-and-compute");
 
-        predictions.print();
+        // --- Predizioni: ML server asincrono oppure bypass ---
+        DataStream<Prediction> predictions;
 
-        // --- JDBC Sink instrumentato: salva predictions + misura latenza ---
-        LatencyTracker latencyTracker = new LatencyTracker();
-        predictions.addSink(new InstrumentedJdbcSink(
-                JDBC_URL, JDBC_USER, JDBC_PASSWORD, latencyTracker
-        )).name("jdbc-sink");
+        if (mlEnabled) {
+            predictions = AsyncDataStream.unorderedWait(
+                    mlRequests,
+                    new AsyncFunction<MlRequest, Prediction>() {
+                        @Override
+                        public void asyncInvoke(MlRequest req, ResultFuture<Prediction> resultFuture) {
+                            CompletableFuture.supplyAsync(() -> {
+                                try {
+                                    URL url = new URL(ML_SERVER_URL);
+                                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                                    conn.setRequestMethod("POST");
+                                    conn.setRequestProperty("Content-Type", "application/json");
+                                    conn.setDoOutput(true);
 
-        // --- Thread di monitoring in background ---
-        // 1 min warmup, poi snapshot periodici ogni 30s.
-        // Alla fine usa il penultimo snapshot (esclude l'ultimo minuto).
-        JvmMetricsCollector jvm = new JvmMetricsCollector();
-        // Array di 1 elemento per condividere gli snapshot col thread (effectively final)
-        final JvmMetricsCollector.MetricsSnapshot[] snapshots = new JvmMetricsCollector.MetricsSnapshot[2];
-        // [0] = start snapshot, [1] = penultimo snapshot (fine misura escluso ultimo minuto)
+                                    try (OutputStream os = conn.getOutputStream()) {
+                                        os.write(req.getJsonPayload().getBytes(StandardCharsets.UTF_8));
+                                    }
 
-        Thread monitorThread = new Thread(() -> {
-            try {
-                BottleneckDetector detector = new BottleneckDetector();
+                                    int code = conn.getResponseCode();
+                                    if (code != 200) {
+                                        conn.disconnect();
+                                        return null;
+                                    }
 
-                // Cgroup check immediato (precondizione di validità)
-                JvmMetricsCollector.CgroupThrottleInfo cgroup = jvm.checkCgroupThrottling();
-                if (cgroup != null) {
-                    cgroup.printReport(System.out);
-                }
+                                    StringBuilder sb = new StringBuilder();
+                                    try (BufferedReader br = new BufferedReader(
+                                            new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                                        String line;
+                                        while ((line = br.readLine()) != null) sb.append(line);
+                                    }
+                                    conn.disconnect();
 
-                // Warmup: aspetta 1 minuto
-                Thread.sleep(60_000);
+                                    JsonObject resp = JsonParser.parseString(sb.toString()).getAsJsonObject();
+                                    Double mambaPred = resp.get("mamba").isJsonNull() ? null : resp.get("mamba").getAsDouble();
+                                    Double lstmPred = resp.get("lstm").isJsonNull() ? null : resp.get("lstm").getAsDouble();
+                                    double harPred = resp.get("har").getAsDouble();
 
-                // Snapshot iniziale (dopo warmup)
-                snapshots[0] = jvm.takeSnapshot(0);
-
-                // Snapshot periodici ogni 30s
-                JvmMetricsCollector.MetricsSnapshot prev = snapshots[0];
-
-                while (!Thread.currentThread().isInterrupted()) {
-                    Thread.sleep(30_000);
-
-                    snapshots[1] = prev;
-                    prev = jvm.takeSnapshot(latencyTracker.getTotalRecorded());
-
-                    // Bottleneck check periodico
-                    try {
-                        List<String> jobIds = detector.getRunningJobIds();
-                        if (!jobIds.isEmpty()) {
-                            detector.detect(jobIds.get(0)).printReport(System.out);
+                                    return new Prediction(
+                                            req.getSymbol(), req.getTimestamp(),
+                                            req.getRvDaily(), req.getRvWeekly(), req.getRvMonthly(),
+                                            mambaPred, lstmPred, harPred);
+                                } catch (Exception e) {
+                                    return null;
+                                }
+                            }).thenAccept(prediction -> {
+                                if (prediction != null) {
+                                    resultFuture.complete(Collections.singleton(prediction));
+                                } else {
+                                    resultFuture.complete(Collections.emptyList());
+                                }
+                            });
                         }
-                    } catch (Exception e) {
-                        // Job non ancora raggiungibile via REST, riprova al prossimo ciclo
-                    }
-                }
-            } catch (InterruptedException e) {
-                // Job finito, il thread viene interrotto
-            }
-        }, "metrics-monitor");
-        monitorThread.setDaemon(true);
-        monitorThread.start();
-
-        try {
-            env.execute("TickVolatilityJob");
-        } finally {
-            monitorThread.interrupt();
-            monitorThread.join(5000);
-
-            // Report JVM finale (start → penultimo snapshot, esclude ultimo minuto)
-            if (snapshots[0] != null && snapshots[1] != null) {
-                jvm.computeReport(snapshots[0], snapshots[1]).printReport(System.out);
-            }
+                    },
+                    mlAsyncTimeoutS, TimeUnit.SECONDS,
+                    mlAsyncCapacity
+            ).name("async-ml-predict");
+        } else {
+            // ML disabilitato: predizione solo con i dati locali (no I/O)
+            predictions = mlRequests.map(req -> new Prediction(
+                    req.getSymbol(), req.getTimestamp(),
+                    req.getRvDaily(), req.getRvWeekly(), req.getRvMonthly(),
+                    null, null, 0.0
+            )).name("ml-bypass");
         }
+
+        // --- JDBC Sink ---
+        predictions.addSink(new RichSinkFunction<Prediction>() {
+            private transient Connection connection;
+            private transient PreparedStatement statement;
+
+            private static final String INSERT_SQL =
+                    "INSERT INTO predictions (symbol, ts, rv_daily, rv_weekly, rv_monthly, mamba_pred, lstm_pred, har_pred) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+            @Override
+            public void open(Configuration parameters) throws Exception {
+                connection = DriverManager.getConnection(JDBC_URL, JDBC_USER, JDBC_PASSWORD);
+                connection.setAutoCommit(true);
+                statement = connection.prepareStatement(INSERT_SQL);
+            }
+
+            @Override
+            public void invoke(Prediction p, Context context) throws Exception {
+                statement.setString(1, p.getSymbol());
+                statement.setLong(2, p.getTimestamp());
+                statement.setDouble(3, p.getRvDaily());
+                statement.setDouble(4, p.getRvWeekly());
+                statement.setDouble(5, p.getRvMonthly());
+                if (p.getMambaPred() != null) {
+                    statement.setDouble(6, p.getMambaPred());
+                } else {
+                    statement.setNull(6, java.sql.Types.DOUBLE);
+                }
+                if (p.getLstmPred() != null) {
+                    statement.setDouble(7, p.getLstmPred());
+                } else {
+                    statement.setNull(7, java.sql.Types.DOUBLE);
+                }
+                statement.setDouble(8, p.getHarPred());
+                statement.executeUpdate();
+            }
+
+            @Override
+            public void close() throws Exception {
+                if (statement != null) statement.close();
+                if (connection != null) connection.close();
+            }
+        }).name("jdbc-sink").setParallelism(sinkParallelism);
+
+        JobExecutionResult result = env.execute("TickVolatilityJob");
+
+        // --- Benchmark: scrivi risultato su CSV ---
+        long totalTicks = result.getAccumulatorResult("tick-counter");
+        long elapsedMs = result.getNetRuntime(TimeUnit.MILLISECONDS);
+        int kafkaPartitions = kafkaPartitionsOverride > 0
+                ? kafkaPartitionsOverride
+                : intConf(conf, "kafka.partitions", 16);
+
+        Path csvPath = Paths.get("src/main/java/results/benchmark.csv");
+        new BenchmarkWriter(csvPath).write(
+                parallelism, kafkaPartitions, checkpointMs,
+                mlEnabled, totalTicks, elapsedMs);
+
+        double throughput = elapsedMs > 0 ? totalTicks / (elapsedMs / 1000.0) : 0;
+        System.out.printf("[benchmark] %,d tick in %,d ms -> %.2f tick/s  (parallelism=%d)%n",
+                totalTicks, elapsedMs, throughput, parallelism);
     }
+
 }

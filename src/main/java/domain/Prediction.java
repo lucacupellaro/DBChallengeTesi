@@ -10,13 +10,7 @@ public class Prediction implements Serializable {
     private double rvMonthly;
     private Double mambaPred;
     private Double lstmPred;
-
-
     private double harPred;
-
-    // wall-clock timestamps per latency tracking
-    private long windowEmitWallClock;    // t0: quando la finestra daily ha emesso
-    private long predictCompleteWallClock; // t1+t2: quando buffer-and-predict ha finito (dopo ML call)
 
     public Prediction() {}
 
@@ -41,11 +35,6 @@ public class Prediction implements Serializable {
     public Double getMambaPred() { return mambaPred; }
     public Double getLstmPred() { return lstmPred; }
     public double getHarPred() { return harPred; }
-
-    public long getWindowEmitWallClock() { return windowEmitWallClock; }
-    public void setWindowEmitWallClock(long t) { this.windowEmitWallClock = t; }
-    public long getPredictCompleteWallClock() { return predictCompleteWallClock; }
-    public void setPredictCompleteWallClock(long t) { this.predictCompleteWallClock = t; }
 
     @Override
     public String toString() {
