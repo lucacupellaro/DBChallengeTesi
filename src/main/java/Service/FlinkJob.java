@@ -41,6 +41,11 @@ import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringSerializer;
+
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -71,6 +76,12 @@ public class FlinkJob {
     private static final String SCHEMA_REGISTRY_URL = "http://localhost:8081";
     private static final String GROUP_ID = "flink-tick-consumer";
     private static final String ML_SERVER_URL = "http://localhost:8080/predict";
+    private static final String DLQ_TOPIC = "ml-failed";
+    private static final int MAX_RETRIES = 3;
+    private static final long INITIAL_BACKOFF_MS = 100;
+    // Circuit breaker: dopo questi fallimenti consecutivi, il circuito si apre
+    private static final int CB_FAILURE_THRESHOLD = 5;
+    private static final long CB_OPEN_DURATION_MS = 30_000; // 30 secondi
     private static final int BUFFER_SIZE = 22; // giorni di storia per RV monthly
 
     // --- Split train/test sull'asse temporale ---
@@ -339,46 +350,123 @@ public class FlinkJob {
             predictions = AsyncDataStream.unorderedWait(
                     mlRequests,
                     new AsyncFunction<MlRequest, Prediction>() {
+
+                        private transient KafkaProducer<String, String> dlqProducer;
+
+                        // Circuit breaker: stato condiviso tra tutte le invocazioni
+                        private int consecutiveFailures = 0;
+                        private long circuitOpenUntil = 0;
+
                         @Override
                         public void asyncInvoke(MlRequest req, ResultFuture<Prediction> resultFuture) {
+                            if (dlqProducer == null) {
+                                Properties props = new Properties();
+                                props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
+                                props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+                                props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+                                dlqProducer = new KafkaProducer<>(props);
+                            }
+
+                            final KafkaProducer<String, String> producer = dlqProducer;
+
                             CompletableFuture.supplyAsync(() -> {
-                                try {
-                                    URL url = new URL(ML_SERVER_URL);
-                                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                                    conn.setRequestMethod("POST");
-                                    conn.setRequestProperty("Content-Type", "application/json");
-                                    conn.setDoOutput(true);
 
-                                    try (OutputStream os = conn.getOutputStream()) {
-                                        os.write(req.getJsonPayload().getBytes(StandardCharsets.UTF_8));
-                                    }
-
-                                    int code = conn.getResponseCode();
-                                    if (code != 200) {
-                                        conn.disconnect();
-                                        return null;
-                                    }
-
-                                    StringBuilder sb = new StringBuilder();
-                                    try (BufferedReader br = new BufferedReader(
-                                            new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                                        String line;
-                                        while ((line = br.readLine()) != null) sb.append(line);
-                                    }
-                                    conn.disconnect();
-
-                                    JsonObject resp = JsonParser.parseString(sb.toString()).getAsJsonObject();
-                                    Double mambaPred = resp.get("mamba").isJsonNull() ? null : resp.get("mamba").getAsDouble();
-                                    Double lstmPred = resp.get("lstm").isJsonNull() ? null : resp.get("lstm").getAsDouble();
-                                    double harPred = resp.get("har").getAsDouble();
-
-                                    return new Prediction(
-                                            req.getSymbol(), req.getTimestamp(),
-                                            req.getRvDaily(), req.getRvWeekly(), req.getRvMonthly(),
-                                            mambaPred, lstmPred, harPred);
-                                } catch (Exception e) {
+                                // --- Circuit Breaker: se aperto, DLQ subito ---
+                                if (System.currentTimeMillis() < circuitOpenUntil) {
+                                    System.err.printf("[ml-predict] Circuit breaker APERTO per %s, invio a DLQ%n",
+                                            req.getSymbol());
+                                    producer.send(new ProducerRecord<>(DLQ_TOPIC, req.getSymbol(), req.getJsonPayload()));
                                     return null;
                                 }
+
+                                // --- Retry con backoff ---
+                                for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                                    try {
+                                        URL url = new URL(ML_SERVER_URL);
+                                        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                                        conn.setRequestMethod("POST");
+                                        conn.setRequestProperty("Content-Type", "application/json");
+                                        conn.setConnectTimeout(5000);
+                                        conn.setReadTimeout(10000);
+                                        conn.setDoOutput(true);
+
+                                        try (OutputStream os = conn.getOutputStream()) {
+                                            os.write(req.getJsonPayload().getBytes(StandardCharsets.UTF_8));
+                                        }
+
+                                        int code = conn.getResponseCode();
+
+                                        // 422 - dati non validi: retry inutile, DLQ subito
+                                        if (code == 422) {
+                                            System.err.printf("[ml-predict] 422 per %s: dati non validi, invio a DLQ%n",
+                                                    req.getSymbol());
+                                            producer.send(new ProducerRecord<>(DLQ_TOPIC, req.getSymbol(), req.getJsonPayload()));
+                                            conn.disconnect();
+                                            return null;
+                                        }
+
+                                        // 500 o altro errore: retry con backoff
+                                        if (code != 200) {
+                                            System.err.printf("[ml-predict] HTTP %d per %s (tentativo %d/%d)%n",
+                                                    code, req.getSymbol(), attempt, MAX_RETRIES);
+                                            conn.disconnect();
+                                            if (attempt < MAX_RETRIES) {
+                                                Thread.sleep(INITIAL_BACKOFF_MS * (1L << (attempt - 1)));
+                                            }
+                                            continue;
+                                        }
+
+                                        // 200 OK: parsing risposta
+                                        StringBuilder sb = new StringBuilder();
+                                        try (BufferedReader br = new BufferedReader(
+                                                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                                            String line;
+                                            while ((line = br.readLine()) != null) sb.append(line);
+                                        }
+                                        conn.disconnect();
+
+                                        JsonObject resp = JsonParser.parseString(sb.toString()).getAsJsonObject();
+                                        Double mambaPred = resp.get("mamba").isJsonNull() ? null : resp.get("mamba").getAsDouble();
+                                        Double lstmPred = resp.get("lstm").isJsonNull() ? null : resp.get("lstm").getAsDouble();
+                                        double harPred = resp.get("har").getAsDouble();
+
+                                        // Successo: reset circuit breaker
+                                        consecutiveFailures = 0;
+
+                                        return new Prediction(
+                                                req.getSymbol(), req.getTimestamp(),
+                                                req.getRvDaily(), req.getRvWeekly(), req.getRvMonthly(),
+                                                mambaPred, lstmPred, harPred);
+
+                                    } catch (Exception e) {
+                                        // Server down o timeout: retry con backoff
+                                        System.err.printf("[ml-predict] Errore per %s (tentativo %d/%d): %s%n",
+                                                req.getSymbol(), attempt, MAX_RETRIES, e.getMessage());
+                                        if (attempt < MAX_RETRIES) {
+                                            try {
+                                                Thread.sleep(INITIAL_BACKOFF_MS * (1L << (attempt - 1)));
+                                            } catch (InterruptedException ie) {
+                                                Thread.currentThread().interrupt();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Tutti i retry falliti: aggiorna circuit breaker
+                                consecutiveFailures++;
+                                if (consecutiveFailures >= CB_FAILURE_THRESHOLD) {
+                                    circuitOpenUntil = System.currentTimeMillis() + CB_OPEN_DURATION_MS;
+                                    System.err.printf("[ml-predict] Circuit breaker APERTO: %d fallimenti consecutivi, " +
+                                            "blocco richieste per %ds%n", consecutiveFailures, CB_OPEN_DURATION_MS / 1000);
+                                }
+
+                                // Invio alla DLQ
+                                System.err.printf("[ml-predict] Retry esauriti per %s, invio a DLQ%n",
+                                        req.getSymbol());
+                                producer.send(new ProducerRecord<>(DLQ_TOPIC, req.getSymbol(), req.getJsonPayload()));
+                                return null;
+
                             }).thenAccept(prediction -> {
                                 if (prediction != null) {
                                     resultFuture.complete(Collections.singleton(prediction));

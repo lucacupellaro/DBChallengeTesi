@@ -14,6 +14,7 @@ import java.time.format.DateTimeFormatter;
 /**
  * Reader "lazy" di UN file CSV giornaliero: legge un tick alla volta
  * (streaming, memoria costante). Non carica mai tutto il file in RAM.
+ * Nessuna validazione sui dati: il filtraggio è delegato a Flink.
  *
  * Schema atteso per riga: DateTime, Bid, Ask, Volume, Spread, Symbol
  *
@@ -68,9 +69,6 @@ public class TickReader implements Closeable {
             double volume = Double.parseDouble(f[3]);
             double spread = Double.parseDouble(f[4]);
             String symbol = f[5].trim();
-
-            // validazione: scarto tick sporchi
-            if (bid <= 0 || ask < bid) return null;
 
             return Tick.newBuilder()  //crea un builder avro
                        .setSymbol(symbol)

@@ -82,7 +82,7 @@ public class Executor {
                 long perFile = 0;
                 try (TickReader reader = new TickReader(giorno)) {
                     Tick tick;
-                    while ((tick = reader.next()) != null) {
+                    while ((tick = reader. next()) != null) {
                         producer.send(new ProducerRecord<>(
                                 TOPIC, tick.getSymbol().toString(), tick));
                         perFile++;

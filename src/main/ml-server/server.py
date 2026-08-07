@@ -1,10 +1,15 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import torch
 import torch.nn as nn
 import numpy as np
+import math
+import logging
 import uvicorn
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ml-server")
 
 try:
     from mamba_ssm import Mamba
@@ -88,41 +93,61 @@ class PredictRequest(BaseModel):
     history: Optional[list[list[float]]] = None  # warmup: 22 giorni di [rv_d, rv_w, rv_m]
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/predict")
 def predict(req: PredictRequest):
-    # HAR: predizione diretta dalle 3 feature correnti
-    har_pred = har_model.predict(req.rv_daily, req.rv_weekly, req.rv_monthly)
+    # Validazione dati in ingresso: se non validi → 422
+    if math.isnan(req.rv_daily) or math.isinf(req.rv_daily) \
+       or math.isnan(req.rv_weekly) or math.isinf(req.rv_weekly) \
+       or math.isnan(req.rv_monthly) or math.isinf(req.rv_monthly):
+        logger.warning("Dati non validi per %s: daily=%.6f weekly=%.6f monthly=%.6f",
+                       req.symbol, req.rv_daily, req.rv_weekly, req.rv_monthly)
+        raise HTTPException(status_code=422, detail="Dati RV contengono NaN o Inf")
 
-    # Warmup: se arriva la storia completa, sostituisci il buffer
-    if req.history is not None:
-        symbol_history[req.symbol] = req.history[-SEQUENCE_LEN:]
-    else:
-        # Aggiorna con i nuovi valori giornalieri
-        features = [req.rv_daily, req.rv_weekly, req.rv_monthly]
-        if req.symbol not in symbol_history:
-            symbol_history[req.symbol] = []
-        symbol_history[req.symbol].append(features)
-        if len(symbol_history[req.symbol]) > SEQUENCE_LEN:
-            symbol_history[req.symbol] = symbol_history[req.symbol][-SEQUENCE_LEN:]
+    try:
+        # HAR: predizione diretta dalle 3 feature correnti
+        har_pred = har_model.predict(req.rv_daily, req.rv_weekly, req.rv_monthly)
 
-    # Mamba e LSTM: servono almeno SEQUENCE_LEN osservazioni
-    mamba_pred = None
-    lstm_pred = None
-    history = symbol_history[req.symbol]
-    if len(history) >= SEQUENCE_LEN:
-        tensor = torch.tensor([history], dtype=torch.float32, device=DEVICE)  # [1, seq, 3]
-        with torch.no_grad():
-            if mamba_model is not None:
-                mamba_pred = mamba_model(tensor).item()
-            lstm_pred = lstm_model(tensor).item()
+        # Warmup: se arriva la storia completa, sostituisci il buffer
+        if req.history is not None:
+            symbol_history[req.symbol] = req.history[-SEQUENCE_LEN:]
+        else:
+            # Aggiorna con i nuovi valori giornalieri
+            features = [req.rv_daily, req.rv_weekly, req.rv_monthly]
+            if req.symbol not in symbol_history:
+                symbol_history[req.symbol] = []
+            symbol_history[req.symbol].append(features)
+            if len(symbol_history[req.symbol]) > SEQUENCE_LEN:
+                symbol_history[req.symbol] = symbol_history[req.symbol][-SEQUENCE_LEN:]
 
-    return {
-        "symbol": req.symbol,
-        "mamba": mamba_pred,
-        "lstm": lstm_pred,
-        "har": har_pred,
-        "device": str(DEVICE),
-    }
+        # Mamba e LSTM: servono almeno SEQUENCE_LEN osservazioni
+        mamba_pred = None
+        lstm_pred = None
+        history = symbol_history[req.symbol]
+        if len(history) >= SEQUENCE_LEN:
+            tensor = torch.tensor([history], dtype=torch.float32, device=DEVICE)  # [1, seq, 3]
+            with torch.no_grad():
+                if mamba_model is not None:
+                    mamba_pred = mamba_model(tensor).item()
+                lstm_pred = lstm_model(tensor).item()
+
+        return {
+            "symbol": req.symbol,
+            "mamba": mamba_pred,
+            "lstm": lstm_pred,
+            "har": har_pred,
+            "device": str(DEVICE),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Errore durante l'inferenza per %s: %s", req.symbol, str(e))
+        raise HTTPException(status_code=500, detail=f"Errore inferenza: {str(e)}")
 
 
 if __name__ == "__main__":
