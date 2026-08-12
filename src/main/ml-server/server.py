@@ -1,85 +1,34 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-import torch
-import torch.nn as nn
 import numpy as np
 import math
 import logging
 import uvicorn
+import torch
+
+from model_loader import load_all
+from vol_models import MIN_HISTORY_HAR, MIN_HISTORY_DEEP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ml-server")
 
-try:
-    from mamba_ssm import Mamba
-    HAS_MAMBA = True
-except ImportError:
-    HAS_MAMBA = False
-
 app = FastAPI()
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
-# Modelli
+# Caricamento modelli con pesi addestrati
 # ---------------------------------------------------------------------------
-
-class MambaVol(nn.Module):
-    def __init__(s, F=3, dm=32):
-        super().__init__()
-        s.proj = nn.Linear(F, dm)
-        s.m = Mamba(d_model=dm, d_state=16, d_conv=4, expand=2)
-        s.n = nn.LayerNorm(dm)
-        s.h = nn.Linear(dm, 1)
-
-    def forward(s, x):
-        z = s.m(s.proj(x))
-        return s.h(s.n(z)[:, -1]).squeeze(-1)
-
-
-class LSTMVol(nn.Module):
-    def __init__(s, F=3, h=32):
-        super().__init__()
-        s.lstm = nn.LSTM(F, h, batch_first=True)
-        s.head = nn.Linear(h, 1)
-
-    def forward(s, x):
-        o, _ = s.lstm(x)
-        return s.head(o[:, -1]).squeeze(-1)
-
-
-class HARVol:
-    """HAR: log-RV(t+1) = b0 + b1*daily + b2*weekly + b3*monthly."""
-    def __init__(self):
-        self.b0 = 0.1
-        self.b1 = 0.4
-        self.b2 = 0.3
-        self.b3 = 0.2
-
-    def predict(self, rv_daily: float, rv_weekly: float, rv_monthly: float) -> float:
-        return self.b0 + self.b1 * rv_daily + self.b2 * rv_weekly + self.b3 * rv_monthly
-
+models = load_all(device=DEVICE)
+har_model = models["har"]
+lstm_model = models["lstm"]
+mamba_model = models["mamba"]
 
 # ---------------------------------------------------------------------------
-# Caricamento modelli all'avvio
+# Buffer: storia dei log-RV per asset (servono per costruire le feature)
 # ---------------------------------------------------------------------------
-
-mamba_model = MambaVol(F=3, dm=32).to(DEVICE).eval() if HAS_MAMBA else None
-lstm_model = LSTMVol(F=3, h=32).to(DEVICE).eval()
-har_model = HARVol()
-
-# TODO: caricare i pesi addestrati
-# mamba_model.load_state_dict(torch.load("weights/mamba.pth", map_location=DEVICE))
-# lstm_model.load_state_dict(torch.load("weights/lstm.pth", map_location=DEVICE))
-# har_model.b0, har_model.b1, har_model.b2, har_model.b3 = <valori OLS>
-
-# ---------------------------------------------------------------------------
-# Buffer per serie storica (per Mamba e LSTM servono sequenze)
-# ---------------------------------------------------------------------------
-
-symbol_history: dict[str, list[list[float]]] = {}
-SEQUENCE_LEN = 22  # giorni di storia da dare ai modelli sequenziali
+symbol_history: dict[str, list[float]] = {}
 
 # ---------------------------------------------------------------------------
 # API
@@ -87,10 +36,11 @@ SEQUENCE_LEN = 22  # giorni di storia da dare ai modelli sequenziali
 
 class PredictRequest(BaseModel):
     symbol: str
-    rv_daily: float
-    rv_weekly: float
-    rv_monthly: float
-    history: Optional[list[list[float]]] = None  # warmup: 22 giorni di [rv_d, rv_w, rv_m]
+    log_rv: Optional[float] = None                     # log-RV del giorno corrente (legacy)
+    rv_daily: Optional[float] = None                   # alias usato dal FlinkJob
+    rv_weekly: Optional[float] = None                  # ignorato (ricalcolato internamente)
+    rv_monthly: Optional[float] = None                 # ignorato (ricalcolato internamente)
+    history: Optional[list] = None                     # warmup: log-RV o triple [d,w,m]
 
 
 @app.get("/health")
@@ -100,47 +50,54 @@ def health():
 
 @app.post("/predict")
 def predict(req: PredictRequest):
-    # Validazione dati in ingresso: se non validi → 422
-    if math.isnan(req.rv_daily) or math.isinf(req.rv_daily) \
-       or math.isnan(req.rv_weekly) or math.isinf(req.rv_weekly) \
-       or math.isnan(req.rv_monthly) or math.isinf(req.rv_monthly):
-        logger.warning("Dati non validi per %s: daily=%.6f weekly=%.6f monthly=%.6f",
-                       req.symbol, req.rv_daily, req.rv_weekly, req.rv_monthly)
-        raise HTTPException(status_code=422, detail="Dati RV contengono NaN o Inf")
+    # Accetta sia log_rv che rv_daily (il FlinkJob manda rv_daily)
+    log_rv = req.log_rv if req.log_rv is not None else req.rv_daily
+    if log_rv is None:
+        raise HTTPException(status_code=422, detail="Serve log_rv o rv_daily")
+    if math.isnan(log_rv) or math.isinf(log_rv):
+        logger.warning("log_rv non valido per %s: %.6f", req.symbol, log_rv)
+        raise HTTPException(status_code=422, detail="log_rv contiene NaN o Inf")
 
     try:
-        # HAR: predizione diretta dalle 3 feature correnti
-        har_pred = har_model.predict(req.rv_daily, req.rv_weekly, req.rv_monthly)
-
         # Warmup: se arriva la storia completa, sostituisci il buffer
+        # Il FlinkJob può mandare history come lista di triple [d,w,m]: prendi solo d
         if req.history is not None:
-            symbol_history[req.symbol] = req.history[-SEQUENCE_LEN:]
+            parsed = []
+            for item in req.history:
+                if isinstance(item, (list, tuple)):
+                    parsed.append(float(item[0]))  # primo elemento = rv_daily
+                else:
+                    parsed.append(float(item))
+            symbol_history[req.symbol] = parsed
         else:
-            # Aggiorna con i nuovi valori giornalieri
-            features = [req.rv_daily, req.rv_weekly, req.rv_monthly]
             if req.symbol not in symbol_history:
                 symbol_history[req.symbol] = []
-            symbol_history[req.symbol].append(features)
-            if len(symbol_history[req.symbol]) > SEQUENCE_LEN:
-                symbol_history[req.symbol] = symbol_history[req.symbol][-SEQUENCE_LEN:]
+            symbol_history[req.symbol].append(log_rv)
 
-        # Mamba e LSTM: servono almeno SEQUENCE_LEN osservazioni
-        mamba_pred = None
+        hist = symbol_history[req.symbol]
+
+        # HAR: servono almeno MIN_HISTORY_HAR giorni
+        har_pred = None
+        if len(hist) >= MIN_HISTORY_HAR:
+            har_pred = har_model.predict(hist)
+
+        # LSTM: servono almeno MIN_HISTORY_DEEP giorni
         lstm_pred = None
-        history = symbol_history[req.symbol]
-        if len(history) >= SEQUENCE_LEN:
-            tensor = torch.tensor([history], dtype=torch.float32, device=DEVICE)  # [1, seq, 3]
-            with torch.no_grad():
-                if mamba_model is not None:
-                    mamba_pred = mamba_model(tensor).item()
-                lstm_pred = lstm_model(tensor).item()
+        if lstm_model is not None and len(hist) >= MIN_HISTORY_DEEP:
+            lstm_pred = lstm_model.predict(hist)
+
+        # Mamba: servono almeno MIN_HISTORY_DEEP giorni + CUDA
+        mamba_pred = None
+        if mamba_model is not None and len(hist) >= MIN_HISTORY_DEEP:
+            mamba_pred = mamba_model.predict(hist)
 
         return {
             "symbol": req.symbol,
-            "mamba": mamba_pred,
-            "lstm": lstm_pred,
             "har": har_pred,
-            "device": str(DEVICE),
+            "lstm": lstm_pred,
+            "mamba": mamba_pred,
+            "device": DEVICE,
+            "buffer_len": len(hist),
         }
 
     except HTTPException:

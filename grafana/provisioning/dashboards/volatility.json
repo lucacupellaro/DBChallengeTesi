@@ -1,0 +1,115 @@
+{
+  "uid": "vol-dashboard",
+  "title": "Volatility Predictions & Portfolio Weights",
+  "timezone": "utc",
+  "refresh": "5s",
+  "time": {
+    "from": "2026-01-01T00:00:00.000Z",
+    "to": "2026-06-01T00:00:00.000Z"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "symbol",
+        "type": "query",
+        "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+        "query": "SELECT DISTINCT symbol FROM predictions ORDER BY symbol",
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Predizioni e Pesi Aggiustati",
+      "gridPos": { "h": 20, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+          "rawSql": "SELECT to_timestamp(ts / 1000) AS \"Data\", symbol AS \"Asset\", rv_daily AS \"RV Daily\", rv_weekly AS \"RV Weekly\", rv_monthly AS \"RV Monthly\", har_pred AS \"HAR pred (t+1)\", lstm_pred AS \"LSTM pred (t+1)\", mamba_pred AS \"Mamba pred (t+1)\", w_har AS \"Peso HAR\", w_lstm AS \"Peso LSTM\", w_mamba AS \"Peso Mamba\", s_adj_har AS \"S adj HAR\", s_adj_lstm AS \"S adj LSTM\", s_adj_mamba AS \"S adj Mamba\" FROM predictions ORDER BY ts DESC, symbol LIMIT 500",
+          "refId": "A",
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "displayMode": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Data" },
+            "properties": [
+              { "id": "custom.width", "value": 160 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Asset" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "RV.*" },
+            "properties": [
+              { "id": "decimals", "value": 6 },
+              { "id": "custom.displayMode", "value": "color-text" },
+              { "id": "color", "value": { "mode": "continuous-BlYlRd" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*pred.*" },
+            "properties": [
+              { "id": "decimals", "value": 6 },
+              { "id": "custom.displayMode", "value": "color-text" },
+              { "id": "color", "value": { "mode": "continuous-BlYlRd" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "Peso.*" },
+            "properties": [
+              { "id": "decimals", "value": 4 },
+              { "id": "thresholds", "value": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 1.5 },
+                  { "color": "red", "value": 2.5 }
+                ]
+              }},
+              { "id": "custom.displayMode", "value": "color-background-solid" }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "S adj.*" },
+            "properties": [
+              { "id": "decimals", "value": 2 },
+              { "id": "unit", "value": "currencyEUR" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          { "displayName": "Data", "desc": true }
+        ],
+        "footer": {
+          "show": false
+        }
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

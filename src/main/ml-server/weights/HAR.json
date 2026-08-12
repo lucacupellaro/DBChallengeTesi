@@ -1,0 +1,16 @@
+{
+  "modello": "HAR-RV",
+  "formula": "log_rv_domani = const + beta_d*lrv_oggi + beta_w*media5 + beta_m*media22",
+  "const": -0.31338317473149185,
+  "beta_d": 0.2917063950979836,
+  "beta_w": 0.21929043592034228,
+  "beta_m": 0.41498007585153035,
+  "meta": {
+    "fold": 4,
+    "n_train": 3596,
+    "train_fino_a": "2026-04-30",
+    "test_da": "2026-05-04",
+    "test_a": "2026-05-21",
+    "storia_minima": 22
+  }
+}

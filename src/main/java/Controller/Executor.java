@@ -77,7 +77,7 @@ public class Executor {
             long totale = 0;
             long start  = System.currentTimeMillis();
 
-            // 3) un giorno alla volta
+            // 3) un giorno alla volta viene mandato nel topic kafka
             for (Path giorno : giorni) {
                 long perFile = 0;
                 try (TickReader reader = new TickReader(giorno)) {

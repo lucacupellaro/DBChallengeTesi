@@ -65,6 +65,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -83,6 +85,12 @@ public class FlinkJob {
     private static final int CB_FAILURE_THRESHOLD = 5;
     private static final long CB_OPEN_DURATION_MS = 30_000; // 30 secondi
     private static final int BUFFER_SIZE = 22; // giorni di storia per RV monthly
+
+    // --- Volatility targeting ---
+    private static final double LEVA_MAX = 3.0;
+    private static final double CAPITALE = 100_000.0;
+    private static final int N_ASSETS = 61;
+    private static final double S_I = CAPITALE / N_ASSETS; // quota equi-ripartita
 
     // --- Split train/test sull'asse temporale ---
     private static final String TEST_START_DATE = System.getProperty("testStart", "");
@@ -352,13 +360,40 @@ public class FlinkJob {
                     new AsyncFunction<MlRequest, Prediction>() {
 
                         private transient KafkaProducer<String, String> dlqProducer;
+                        private transient Map<String, Double> volTargets;
 
                         // Circuit breaker: stato condiviso tra tutte le invocazioni
                         private int consecutiveFailures = 0;
                         private long circuitOpenUntil = 0;
 
+                        private void loadVolTargets() {
+                            if (volTargets != null) return;
+                            volTargets = new HashMap<>();
+                            try (InputStream is = FlinkJob.class.getClassLoader()
+                                    .getResourceAsStream("vol_targets.json");
+                                 BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                                StringBuilder sb = new StringBuilder();
+                                String line;
+                                while ((line = br.readLine()) != null) sb.append(line);
+                                JsonObject root = JsonParser.parseString(sb.toString()).getAsJsonObject();
+                                JsonObject perAsset = root.getAsJsonObject("vol_target_per_asset");
+                                for (Map.Entry<String, com.google.gson.JsonElement> entry : perAsset.entrySet()) {
+                                    volTargets.put(entry.getKey(), entry.getValue().getAsDouble());
+                                }
+                                System.out.printf("[vol-target] Caricati %d vol_target per asset%n", volTargets.size());
+                            } catch (Exception e) {
+                                System.err.println("[vol-target] Errore caricamento vol_targets.json: " + e.getMessage());
+                            }
+                        }
+
+                        private double calcWeight(double volTarget, double sigmaPred) {
+                            if (sigmaPred <= 0) return 0.0;
+                            return Math.min((volTarget * volTarget) / (sigmaPred * sigmaPred), LEVA_MAX);
+                        }
+
                         @Override
                         public void asyncInvoke(MlRequest req, ResultFuture<Prediction> resultFuture) {
+                            loadVolTargets();
                             if (dlqProducer == null) {
                                 Properties props = new Properties();
                                 props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
@@ -433,10 +468,24 @@ public class FlinkJob {
                                         // Successo: reset circuit breaker
                                         consecutiveFailures = 0;
 
+                                        // --- Volatility targeting: calcolo pesi ---
+                                        Double vt = volTargets.get(req.getSymbol());
+                                        double volTarget = (vt != null) ? vt : 0.0;
+
+                                        double wHar = calcWeight(volTarget, harPred);
+                                        Double wLstm = (lstmPred != null) ? calcWeight(volTarget, lstmPred) : null;
+                                        Double wMamba = (mambaPred != null) ? calcWeight(volTarget, mambaPred) : null;
+
+                                        double sAdjHar = S_I * wHar;
+                                        Double sAdjLstm = (wLstm != null) ? S_I * wLstm : null;
+                                        Double sAdjMamba = (wMamba != null) ? S_I * wMamba : null;
+
                                         return new Prediction(
                                                 req.getSymbol(), req.getTimestamp(),
                                                 req.getRvDaily(), req.getRvWeekly(), req.getRvMonthly(),
-                                                mambaPred, lstmPred, harPred);
+                                                mambaPred, lstmPred, harPred,
+                                                wHar, wLstm, wMamba,
+                                                sAdjHar, sAdjLstm, sAdjMamba);
 
                                     } catch (Exception e) {
                                         // Server down o timeout: retry con backoff
@@ -484,7 +533,9 @@ public class FlinkJob {
             predictions = mlRequests.map(req -> new Prediction(
                     req.getSymbol(), req.getTimestamp(),
                     req.getRvDaily(), req.getRvWeekly(), req.getRvMonthly(),
-                    null, null, 0.0
+                    null, null, 0.0,
+                    0.0, null, null,
+                    0.0, null, null
             )).name("ml-bypass");
         }
 
@@ -494,8 +545,9 @@ public class FlinkJob {
             private transient PreparedStatement statement;
 
             private static final String INSERT_SQL =
-                    "INSERT INTO predictions (symbol, ts, rv_daily, rv_weekly, rv_monthly, mamba_pred, lstm_pred, har_pred) " +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+                    "INSERT INTO predictions (symbol, ts, rv_daily, rv_weekly, rv_monthly, mamba_pred, lstm_pred, har_pred, " +
+                    "w_har, w_lstm, w_mamba, s_adj_har, s_adj_lstm, s_adj_mamba) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
             @Override
             public void open(Configuration parameters) throws Exception {
@@ -522,6 +574,28 @@ public class FlinkJob {
                     statement.setNull(7, java.sql.Types.DOUBLE);
                 }
                 statement.setDouble(8, p.getHarPred());
+                statement.setDouble(9, p.getWHar());
+                if (p.getWLstm() != null) {
+                    statement.setDouble(10, p.getWLstm());
+                } else {
+                    statement.setNull(10, java.sql.Types.DOUBLE);
+                }
+                if (p.getWMamba() != null) {
+                    statement.setDouble(11, p.getWMamba());
+                } else {
+                    statement.setNull(11, java.sql.Types.DOUBLE);
+                }
+                statement.setDouble(12, p.getSAdjHar());
+                if (p.getSAdjLstm() != null) {
+                    statement.setDouble(13, p.getSAdjLstm());
+                } else {
+                    statement.setNull(13, java.sql.Types.DOUBLE);
+                }
+                if (p.getSAdjMamba() != null) {
+                    statement.setDouble(14, p.getSAdjMamba());
+                } else {
+                    statement.setNull(14, java.sql.Types.DOUBLE);
+                }
                 statement.executeUpdate();
             }
 
@@ -539,7 +613,7 @@ public class FlinkJob {
         long elapsedMs = result.getNetRuntime(TimeUnit.MILLISECONDS);
         int kafkaPartitions = kafkaPartitionsOverride > 0
                 ? kafkaPartitionsOverride
-                : intConf(conf, "kafka.partitions", 16);
+                : intConf(conf, "kafka.partitions", 8);
 
         Path csvPath = Paths.get("src/main/java/results/benchmark.csv");
         new BenchmarkWriter(csvPath).write(

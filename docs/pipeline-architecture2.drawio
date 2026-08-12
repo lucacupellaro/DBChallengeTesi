@@ -40,7 +40,7 @@
         <mxCell id="kafka-label" parent="1" style="text;html=1;align=center;verticalAlign=middle;fontSize=13;fontColor=#333333;" value="&lt;b&gt;MESSAGE BROKER&lt;/b&gt;" vertex="1">
           <mxGeometry height="25" width="140" x="430" y="45" as="geometry" />
         </mxCell>
-        <mxCell id="kafka-ticks" parent="1" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;size=15;fillColor=#f8cecc;strokeColor=#b85450;" value="&lt;b&gt;Kafka&lt;/b&gt;&lt;br&gt;Topic: &lt;code&gt;ticks&lt;/code&gt;&lt;br&gt;(16 partizioni)&lt;br&gt;:9092" vertex="1">
+        <mxCell id="kafka-ticks" parent="1" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;size=15;fillColor=#f8cecc;strokeColor=#b85450;" value="&lt;b&gt;Kafka&lt;/b&gt;&lt;br&gt;Topic: &lt;code&gt;ticks&lt;/code&gt;&lt;br&gt;(8 partizioni)&lt;br&gt;:9092" vertex="1">
           <mxGeometry height="90" width="150" x="425" y="110" as="geometry" />
         </mxCell>
         <mxCell id="kafka-dlq" parent="1" style="shape=hexagon;perimeter=hexagonPerimeter2;whiteSpace=wrap;html=1;fixedSize=1;size=15;fillColor=#f8cecc;strokeColor=#b85450;" value="&lt;b&gt;Kafka DLQ&lt;/b&gt;&lt;br&gt;Topic: &lt;code&gt;ml-failed&lt;/code&gt;&lt;br&gt;&lt;i&gt;Dead Letter Queue&lt;/i&gt;" vertex="1">

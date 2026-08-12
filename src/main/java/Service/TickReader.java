@@ -13,8 +13,7 @@ import java.time.format.DateTimeFormatter;
 
 /**
  * Reader "lazy" di UN file CSV giornaliero: legge un tick alla volta
- * (streaming, memoria costante). Non carica mai tutto il file in RAM.
- * Nessuna validazione sui dati: il filtraggio è delegato a Flink.
+ * (streaming, memoria costante). Non carica mai tutto il file in RAM. Qui viene fatta la conversione in ogetto Avro
  *
  * Schema atteso per riga: DateTime, Bid, Ask, Volume, Spread, Symbol
  *
