@@ -1,0 +1,375 @@
+================================================================================
+                         SCALETTA TESI - VOLATILITY FORECASTING
+                    Pipeline di stream processing per la previsione
+                  della volatilita' realizzata con modelli ML su Flink
+================================================================================
+
+
+1. INTRODUZIONE
+--------------------------------------------------------------------------------
+   Obiettivo: costruire un sistema end-to-end che, a partire da dati tick-level
+   di mercato, calcoli la Realized Variance giornaliera in tempo reale e
+   produca previsioni della volatilita' del giorno successivo usando tre
+   modelli (HAR, LSTM, Mamba), con applicazione al volatility targeting
+   di portafoglio.
+
+   1.1  Motivazione e problema
+        - La volatilita' e' il parametro chiave nella gestione del rischio
+        - I dati tick-level arrivano a milioni di eventi/giorno (67M tick
+          per 100 giorni, 61 asset): servono architetture scalabili
+        - I modelli classici (GARCH, HAR) sono stimati offline su batch;
+          integrarli in una pipeline streaming e' un problema aperto
+        - Domanda di ricerca: "Quanto migliora la qualita' delle previsioni
+          e del risk management se si usano modelli deep (LSTM, Mamba)
+          rispetto al baseline HAR, e come si progetta un sistema che
+          li esegua in tempo reale?"
+
+   1.2  Contributi della tesi
+        - Progettazione e implementazione di una pipeline streaming completa:
+          ingestione -> calcolo RV -> previsione ML -> volatility targeting
+        - Confronto sistematico HAR vs LSTM vs Mamba su dati tick reali
+          con cross-validazione walk-forward a 4 fold
+        - Studio di scalabilita': throughput al variare di parallelismo
+          Flink e partizioni Kafka
+        - Integrazione di pattern di resilienza (circuit breaker, DLQ,
+          retry con backoff esponenziale)
+
+   1.3  Struttura della tesi
+        - Breve mappa dei capitoli
+
+
+2. BACKGROUND E STATO DELL'ARTE
+--------------------------------------------------------------------------------
+   2.1  Realized Variance e volatilita' intraday
+        - Definizione formale di RV: somma dei log-return al quadrato
+          campionati a frequenza fissa (5 minuti)
+        - Previous-tick sampling: mid = (bid+ask)/2, ultimo tick della
+          finestra
+        - Log-return: r_i = log(mid_i / mid_{i-1}), senza gap overnight
+        - Perche' lavorare in log-space: lrv = log(RV), stabilita' numerica
+
+   2.2  Modello HAR-RV (Corsi 2009)
+        - Componenti eterogenee: giornaliera, settimanale (5gg), mensile (22gg)
+        - Regressione lineare: log(RV_{t+1}) = b0 + b_d*lrv_t + b_w*media_5 + b_m*media_22
+        - Stimato con OLS (soluzione analitica)
+        - Vantaggi: interpretabile, veloce, nessuna dipendenza da GPU
+        - Limite: relazione lineare, non cattura pattern non lineari
+
+   2.3  LSTM per serie temporali finanziarie
+        - Architettura: gate di input/forget/output, cella di memoria
+        - Perche' funziona sulla volatilita': cattura dipendenze temporali
+          non lineari e clustering della volatilita'
+        - Riferimenti: letteratura su LSTM per vol forecasting
+
+   2.4  Mamba e State Space Models (Gu & Dao, 2023)
+        - Selective State Space: alternativa ai Transformer con
+          complessita' O(L) invece di O(L^2)
+        - Meccanismo di selezione: aggiornamento selettivo dello stato
+        - Kernel d_conv=4, d_state=16: significato dei parametri
+        - Perche' provarlo sulla volatilita': sequenze lunghe, efficienza
+        - Limite: richiede CUDA (kernel senza fallback CPU)
+
+   2.5  Volatility targeting e gestione del rischio
+        - Concetto: aggiustare la dimensione della posizione per mantenere
+          un livello di rischio costante
+        - Formula: w = min((vol_target / sigma_pred)^2, leva_max)
+        - Interpretazione: se la vol prevista e' alta, riduci l'esposizione
+        - Letteratura: Moreira & Muir (2017), risk parity
+
+   2.6  Stream processing e Apache Flink
+        - Event time vs processing time
+        - Watermark e finestre tumbling
+        - Exactly-once semantics e checkpointing
+        - Async I/O per integrazioni esterne
+        - Perche' Flink e non Spark Streaming / Kafka Streams
+
+
+3. DATI
+--------------------------------------------------------------------------------
+   3.1  Dataset
+        - 61 asset (azioni US, EU, UK, Svezia, Svizzera)
+        - 100 giorni di trading (gen-mag 2026)
+        - ~67 milioni di tick totali
+        - Formato CSV: DateTime, Bid, Ask, Volume, Spread, Symbol
+        - Frequenza: tick-by-tick (microsecondi)
+
+   3.2  Preprocessing nel notebook (AnalyzeTicker.ipynb)
+        - Costruzione barre: aggregazione tick con counting
+        - Calcolo OHLC, spread relativo, order book imbalance
+        - Aggregazione giornaliera: r_oc, vol_d, spread_d, ntick_d, rv_d
+        - Feature rolling: r_5d, r_10d, vol_10d
+        - Subsampling a 5 minuti per il calcolo della RV
+        - Pulizia: rimozione giorni con meno di N tick
+
+   3.3  Split train/test
+        - Walk-forward: primo 40% warmup, poi 4 fold sequenziali
+        - Embargo di 1 giorno tra train e test (il target e' t+1)
+        - Nessun look-ahead: mu/sigma calcolati solo sul train
+        - Stessi confini di fold per tutti e 3 i modelli
+
+
+4. MODELLI DI PREVISIONE DELLA VOLATILITA'
+--------------------------------------------------------------------------------
+   Tutto lo studio e' nel notebook AnalyzeTicker.ipynb
+
+   4.1  HAR-RV
+        - Feature: [lrv_t, media_5gg, media_22gg]
+        - Fitting: OLS con numpy.linalg.lstsq
+        - Ri-stima per ogni fold (expanding window)
+        - Artefatto esportato: HAR.json (const, beta_d, beta_w, beta_m)
+
+   4.2  LSTM
+        - Architettura: LSTM(input=3, hidden=32) + Linear(32,1)
+        - Input: sequenza di 22 timestep, ciascuno con 3 feature [lrv, rv_w, rv_m]
+        - Output: log(RV_{t+1}) scalare
+        - Training: Adam lr=1e-3, batch=256, 400 step, MSELoss normalizzata
+        - Gradient clipping a 5.0
+        - Standardizzazione: (x - mu) / sd con mu/sd congelati dal train
+        - ~3K parametri
+        - Artefatto: LSTM.pt (state_dict + mu + sd + meta)
+
+   4.3  Mamba
+        - Architettura: Linear(3,32) -> Mamba(d_model=32, d_state=16, d_conv=4,
+          expand=2) -> LayerNorm -> Linear(32,1)
+        - Stesse feature e sequenze dell'LSTM (22 timestep, 3 feature)
+        - Training: identico all'LSTM (Adam, lr=1e-3, batch=256, 400 step)
+        - ~5K parametri
+        - Richiede CUDA
+        - Artefatto: Mamba.pt
+
+   4.4  Modelli pooled
+        - Tutti e 3 i modelli sono POOLED: stessi parametri per tutti i 61 asset
+        - Nessun embedding per asset, nessun fine-tuning per asset
+        - Stato per asset = solo la storia dei log-RV
+        - Vantaggio: generalizzazione, niente overfitting su singolo titolo
+
+   4.5  Risultati out-of-sample (dal notebook)
+        - Metriche: R^2 pooled, R^2 within-asset, QLIKE, MAPE, SMAPE, MASE, RMSSE
+        - Tutti battono il naive (MASE < 1)
+        - Ordinamento: Mamba > LSTM > HAR su tutte le metriche
+        - QLIKE (metrica standard per vol): Mamba migliore del ~6% vs HAR
+        - Diagnostica residui: test di normalita' (Anderson-Darling),
+          omoschedasticita' (Breusch-Pagan, White), indipendenza (Ljung-Box)
+        - [INSERIRE TABELLA RISULTATI DAL NOTEBOOK]
+
+
+5. ARCHITETTURA DELLA PIPELINE
+--------------------------------------------------------------------------------
+   5.1  Vista d'insieme
+        CSV -> Kafka Producer -> Topic "ticks" (Avro) -> Flink Consumer
+        -> Finestra 5min -> Finestra giornaliera -> Buffer 22gg
+        -> ML Server (HTTP async) -> JDBC Sink -> PostgreSQL -> Grafana
+
+   5.2  Livello di ingestione (Executor.java)
+        - Lettura CSV giornalieri in ordine cronologico
+        - Serializzazione Avro con Schema Registry
+        - Produzione su topic Kafka "ticks" (8 partizioni)
+        - Filtro opzionale: fromDate, maxDays
+        - Throughput misurato: ~420K tick/s
+
+   5.3  Schema Avro (tick.avsc)
+        - Campi: symbol, timestamp, bid, ask, volume, spread
+        - Evoluzione schema con Confluent Schema Registry
+
+   5.4  Topologia Flink (FlinkJob.java)
+
+        5.4.1  Kafka Source
+               - Consumer group: flink-tick-consumer
+               - Bounded mode: earliest -> latest (replay completo)
+               - Watermark: BoundedOutOfOrderness(3 secondi)
+
+        5.4.2  Filtro tick invalidi
+               - Validazione: ts>0, bid>0, ask>0, ask>=bid, vol>=0
+               - Accumulatore tick-counter per benchmark
+
+        5.4.3  Finestra 5 minuti: tick -> log-return
+               - TumblingEventTimeWindows(5 min), keyBy(symbol)
+               - Aggregatore LogRetAgg: stato costante 40 byte
+               - Identita' telescopica: log(bidMax/bidMin) senza
+                 tenere tutti i tick in memoria
+               - Output: FiveMinReturn(symbol, ts, logReturn)
+
+        5.4.4  Finestra giornaliera: 5-min returns -> RV daily
+               - TumblingEventTimeWindows(1 day), keyBy(symbol)
+               - Aggregatore RvAgg: stato costante 12 byte
+               - Somma dei quadrati dei log-return (realized variance)
+               - Output: DailyRV(symbol, ts, rvDaily)
+
+        5.4.5  Buffer 22 giorni e calcolo feature (KeyedProcessFunction)
+               - ListState<DailyRV>: buffer circolare degli ultimi 22 giorni
+               - ValueState<Boolean>: flag di warmup
+               - Quando il buffer e' pieno:
+                 * rvDaily = history[-1]
+                 * rvWeekly = media ultimi 5 giorni
+                 * rvMonthly = media ultimi 22 giorni
+               - Gate di warmup: se testStart definito, non emette
+                 predizioni prima di quella data
+               - Prima chiamata: manda storia completa al ML server
+               - Output: MlRequest(symbol, ts, rvDaily, rvWeekly, rvMonthly, json)
+
+        5.4.6  Chiamata asincrona al ML server (AsyncDataStream)
+               - unorderedWait, capacity=20, timeout=30s
+               - CompletableFuture.supplyAsync per HTTP non bloccante
+               - Risposta: {har, lstm, mamba} predizioni
+               - Calcolo pesi di volatility targeting in-line
+               - Output: Prediction con 14 campi
+
+        5.4.7  JDBC Sink
+               - INSERT INTO predictions
+               - Parallelismo separato (4)
+               - AutoCommit = true
+
+   5.5  Gestione dello stato
+        - Tabella riassuntiva stato per operatore:
+          * filter: 8 byte (accumulatore)
+          * 5-min window: 40 byte per simbolo (LogRetAcc)
+          * daily window: 12 byte per simbolo (RvAcc)
+          * buffer: 22*24 byte per simbolo (ListState)
+        - Checkpointing: exactly-once, 60s, retain on cancellation
+        - Scelta progettuale: accumulatori a stato costante invece
+          di buffer lineari -> scalabilita' con il numero di asset
+
+   5.6  ML Server (FastAPI + PyTorch)
+        - Endpoint /predict: riceve RV, restituisce predizioni
+        - Caricamento modelli all'avvio (load_all)
+        - Buffer per-symbol lato server (symbol_history)
+        - HAR: sempre disponibile (solo numpy)
+        - LSTM: disponibile se LSTM.pt presente (CPU o CUDA)
+        - Mamba: disponibile solo su CUDA
+        - Contratto di inferenza (vol_models.py):
+          * Input: storia di log-RV >= 22gg (HAR) o >= 43gg (deep)
+          * Output: RV prevista in livello (exp(log_pred))
+          * Standardizzazione congelata dal train
+
+
+6. PATTERN DI RESILIENZA
+--------------------------------------------------------------------------------
+   6.1  Circuit breaker
+        - Soglia: 5 fallimenti consecutivi -> circuito aperto
+        - Durata apertura: 30 secondi (nessuna richiesta al ML server)
+        - Reset automatico dopo la durata
+        - Scopo: evitare cascading failure se il ML server e' down
+
+   6.2  Retry con backoff esponenziale
+        - Max 3 tentativi per richiesta
+        - Backoff: 100ms * 2^(tentativo-1)
+        - HTTP 422 (dati invalidi) -> nessun retry, DLQ immediato
+        - HTTP 500+ o timeout -> retry
+
+   6.3  Dead Letter Queue (DLQ)
+        - Topic Kafka "ml-failed"
+        - Messaggi inviati quando: retry esauriti, circuit breaker aperto,
+          errore 422
+        - DlqReprocessor: job separato che riprocessa i messaggi
+          * Aspetta che il ML server sia healthy (polling /health)
+          * Richiede con rate limiting (500ms tra richieste)
+          * Inserisce in PostgreSQL dopo successo
+
+   6.4  Bypass ML
+        - Flag ml.enabled=false in pipeline.properties
+        - Predizione dummy (0.0) senza nessuna chiamata HTTP
+        - Utile per isolare il bottleneck ML nei benchmark
+
+
+7. VOLATILITY TARGETING
+--------------------------------------------------------------------------------
+   7.1  Calibrazione dei target (dal notebook)
+        - Per ogni fold: mediana delle previsioni HAR in-sample sul train
+        - Per-asset: un target diverso per ogni simbolo
+        - Congelato: ricalcolato solo al re-training
+        - Artefatto: vol_targets.json (61 target, da 0.81% a 2.76%)
+
+   7.2  Calcolo dei pesi nella pipeline
+        - Formula: w = min((vol_target^2 / sigma_pred^2), 3.0)
+        - Interpretazione: se vol prevista alta -> peso basso -> meno esposizione
+        - Leva massima: 3.0x (risk cap)
+        - Capitale: 100.000 EUR, equi-ripartito su 61 asset
+        - S_i = 100.000/61 = 1.639 EUR per asset
+        - S_adj = S_i * w = posizione aggiustata per il rischio
+
+   7.3  Tre set di pesi paralleli
+        - w_har, s_adj_har (sempre disponibili)
+        - w_lstm, s_adj_lstm (null se LSTM non disponibile)
+        - w_mamba, s_adj_mamba (null se Mamba non disponibile)
+        - Confronto: quale modello produce pesi piu' stabili?
+
+   7.4  Risultati di strategia (dal notebook)
+        - Sharpe ratio per strategia (buy&hold vs vol-managed per modello)
+        - Drawdown massimo: riduzione con vol targeting
+        - Costi di transazione: commissioni + spread
+
+
+8. BENCHMARK E SCALABILITA'
+--------------------------------------------------------------------------------
+   8.1  Setup sperimentale
+        - Modalita' benchmark: sweep di parallelismo (2,4,6,8,10,12)
+        - Modalita' benchmark-full: matrice partizioni x parallelismo
+          (partizioni: 2,4,8,16) x (parallelismo: 2,4,6,8,10,12) = 24 run
+        - Metriche: throughput (tick/s), tempo totale (ms)
+        - BenchmarkRunner: ricrea topic Kafka per ogni configurazione
+
+   8.2  Risultati
+        - Throughput vs parallelismo (curva di scaling)
+        - Effetto delle partizioni Kafka
+        - Overhead del ML server (ml.enabled=true vs false)
+        - Punto di saturazione (dove aggiungere thread non aiuta)
+        - [INSERIRE GRAFICI E TABELLE DA benchmark.csv]
+
+   8.3  Discussione
+        - Collo di bottiglia: I/O verso ML server vs computazione Flink
+        - Effetto del checkpointing sul throughput
+        - Parallelismo ottimale per questo workload
+
+
+9. VISUALIZZAZIONE (GRAFANA)
+--------------------------------------------------------------------------------
+   9.1  Architettura di monitoring
+        - PostgreSQL come data source
+        - Dashboard provisionata: "Volatility Predictions & Portfolio Weights"
+        - Refresh automatico ogni 5 secondi
+
+   9.2  Pannelli
+        - Tabella con 14 colonne: Data, Asset, RV daily/weekly/monthly,
+          predizioni HAR/LSTM/Mamba, pesi, posizioni aggiustate
+        - Filtro per simbolo (variabile template)
+        - Color coding: gradiente per RV, soglie per pesi (verde/giallo/rosso)
+
+
+10. CONCLUSIONI
+--------------------------------------------------------------------------------
+   10.1 Sintesi dei risultati
+        - La pipeline funziona end-to-end: 67M tick -> 1482 predizioni
+        - Mamba > LSTM > HAR nella qualita' delle previsioni
+        - Il volatility targeting riduce il drawdown significativamente
+        - Il sistema e' resiliente (circuit breaker, DLQ)
+
+   10.2 Limiti
+        - Un solo giorno di dati per il test della pipeline real-time
+        - Mamba richiede GPU (non deployabile ovunque)
+        - Costi di transazione stimati, non reali
+        - Modelli pooled: nessuna personalizzazione per asset
+
+   10.3 Sviluppi futuri
+        - Streaming continuo (non bounded): ingestione live da broker
+        - Modelli online: re-training incrementale
+        - Ensemble dei 3 modelli con pesi dinamici
+        - Estensione a piu' asset class (futures, crypto, FX)
+        - Deploy su Kubernetes con auto-scaling del ML server
+
+
+================================================================================
+STIMA APPROSSIMATIVA DELLE SEZIONI
+================================================================================
+Cap 1 - Introduzione                    ~5 pagine
+Cap 2 - Background                      ~15 pagine
+Cap 3 - Dati                            ~5 pagine
+Cap 4 - Modelli                         ~15 pagine  (molto dal notebook)
+Cap 5 - Architettura pipeline           ~20 pagine  (cuore della tesi)
+Cap 6 - Pattern di resilienza           ~5 pagine
+Cap 7 - Volatility targeting            ~8 pagine
+Cap 8 - Benchmark                       ~8 pagine
+Cap 9 - Visualizzazione                 ~3 pagine
+Cap 10 - Conclusioni                    ~3 pagine
+                                        -----------
+                                        ~87 pagine (senza appendici/bibliografia)
+================================================================================

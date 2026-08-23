@@ -116,6 +116,12 @@ public class FlinkJob {
         } catch (Exception e) {
             System.out.println("[config] pipeline.properties non trovato, uso default");
         }
+        // una -Dchiave=valore sulla riga di comando ha la precedenza sul file:
+        // serve ai benchmark per variare un parametro senza riscrivere le properties
+        for (String key : props.stringPropertyNames()) {
+            String override = System.getProperty(key);
+            if (override != null) props.setProperty(key, override);
+        }
         return props;
     }
 
@@ -172,6 +178,10 @@ public class FlinkJob {
         env.getCheckpointConfig().setExternalizedCheckpointCleanup(
                 CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
         env.setParallelism(parallelism);
+        // maxParallelism (numero di key group) resta al default di Flink: calibrarlo per
+        // separare i simboli piu' pesanti fra i subtask riduce lo sbilanciamento da 2,62x a
+        // 1,63x ma NON cambia il throughput, perche' il collo di bottiglia e' l'ingestione,
+        // non l'aggregazione. Misure e motivazione in docs/skew-partitioning.md §2.
 
         if (TEST_START_DATE.isEmpty()) {
             System.out.println("[split] nessun gate di warmup: inferenze su tutti i giorni ingeriti");
@@ -256,8 +266,14 @@ public class FlinkJob {
                                 RvAcc acc = accs.iterator().next();
                                 if (acc.count == 0) return;
 
+                                // sqrt: i modelli sono addestrati su log(sqrt(somma dei quadrati)),
+                                // cioe' su una VOLATILITA' giornaliera (deviazione standard), non
+                                // sulla varianza. Lo conferma lo stato stazionario di HAR:
+                                // const/(1-somma beta) = -4,234 -> exp = 0,0145, che coincide con
+                                // vol_target_comune = 0,0148. Senza la radice il modello riceve
+                                // log(varianza) ~ -8,47 invece di ~ -4,23 e predice 50x fuori scala.
                                 out.collect(new DailyRV(
-                                        symbol, ctx.window().getEnd(), acc.sumSquared));
+                                        symbol, ctx.window().getEnd(), Math.sqrt(acc.sumSquared)));
                             }
                         }).name("daily-rv");
 
@@ -386,9 +402,16 @@ public class FlinkJob {
                             }
                         }
 
+                        /**
+                         * Peso di volatility targeting: w = clip(vol_target / sigma_prevista, 0, leva_max),
+                         * la formula dichiarata da vol_targets.json e prodotta dal notebook.
+                         * Il rapporto e' LINEARE, non quadratico: solo cosi' la vol di portafoglio
+                         * risulta costante (w * sigma = target). Con il rapporto al quadrato darebbe
+                         * target^2/sigma, cioe' inversamente proporzionale a sigma.
+                         */
                         private double calcWeight(double volTarget, double sigmaPred) {
                             if (sigmaPred <= 0) return 0.0;
-                            return Math.min((volTarget * volTarget) / (sigmaPred * sigmaPred), LEVA_MAX);
+                            return Math.min(volTarget / sigmaPred, LEVA_MAX);
                         }
 
                         @Override
@@ -547,7 +570,19 @@ public class FlinkJob {
             private static final String INSERT_SQL =
                     "INSERT INTO predictions (symbol, ts, rv_daily, rv_weekly, rv_monthly, mamba_pred, lstm_pred, har_pred, " +
                     "w_har, w_lstm, w_mamba, s_adj_har, s_adj_lstm, s_adj_mamba) " +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                    // Sink idempotente. Il checkpointing e' EXACTLY_ONCE ma questo sink non
+                    // partecipa al commit a due fasi (autoCommit=true), quindi al riavvio da
+                    // checkpoint Flink rilegge da Kafka, ricalcola e riscrive le predizioni
+                    // gia' emesse dopo l'ultimo checkpoint. La topologia produce una sola
+                    // predizione per (symbol, giorno) — finestra giornaliera con keyBy(symbol) —
+                    // quindi quella coppia identifica il record e la riscrittura puo' essere
+                    // assorbita: si passa da "aggiungi una riga" a "fai in modo che la riga
+                    // esista", cioe' da at-least-once a effectively-once sul database.
+                    // DO NOTHING e non DO UPDATE: il server ML tiene symbol_history al proprio
+                    // interno, fuori dal checkpoint, quindi al replay la predizione ricalcolata
+                    // puo' differire. Si tiene la prima, prodotta con lo stato ML coerente.
+                    "ON CONFLICT (symbol, ts) DO NOTHING";
 
             @Override
             public void open(Configuration parameters) throws Exception {

@@ -1,5 +1,6 @@
 package Controller;
 
+import Service.PartitionPlanner;
 import Service.TickReader;
 import domain.Tick;
 
@@ -14,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -74,23 +76,64 @@ public class Executor {
                               giorni.get(0).getFileName(),
                               giorni.get(giorni.size() - 1).getFileName());
 
+            // 2b) partizionamento load-aware (-Dpartitioner=lpt|hash, default lpt).
+            //     "hash" = partitioner di default di Kafka, murmur2(symbol) % P: cieco al
+            //     carico, sbilancia ~2,4x. "lpt" = mappa ricalcolata a ogni fine giornata
+            //     sulla media dei tick degli ultimi N giorni (solo passato), vedi
+            //     PartitionPlanner e docs/skew-partitioning.md.
+            String mode = System.getProperty("partitioner", "lpt");
+            int window  = Integer.getInteger("partitioner.window", 2);
+            int numPartitions = producer.partitionsFor(TOPIC).size();
+            PartitionPlanner planner = "lpt".equalsIgnoreCase(mode)
+                    ? new PartitionPlanner(numPartitions, window) : null;
+            System.out.printf("[producer] partitioner=%s  partizioni=%d%s%n",
+                    mode, numPartitions,
+                    planner == null ? "" : "  finestra=" + window + "gg");
+
             long totale = 0;
             long start  = System.currentTimeMillis();
 
             // 3) un giorno alla volta viene mandato nel topic kafka
             for (Path giorno : giorni) {
                 long perFile = 0;
+                // piano calcolato SOLO sui giorni gia' ingeriti; null finche' manca storia
+                Map<String, Integer> plan = planner == null ? null : planner.planFor();
+                long[] perPartition = new long[numPartitions];
+
                 try (TickReader reader = new TickReader(giorno)) {
                     Tick tick;
                     while ((tick = reader. next()) != null) {
-                        producer.send(new ProducerRecord<>(
-                                TOPIC, tick.getSymbol().toString(), tick));
+                        String symbol = tick.getSymbol().toString();
+                        Integer partition = plan == null ? null : plan.get(symbol);
+                        producer.send(partition == null
+                                ? new ProducerRecord<>(TOPIC, symbol, tick)
+                                : new ProducerRecord<>(TOPIC, partition, symbol, tick));
+                        if (planner != null) {
+                            planner.record(symbol);
+                            // la diagnostica conta solo i tick instradati dal piano; quelli
+                            // lasciati all'hash (warmup, simboli mai visti) non sono tracciabili
+                            // qui senza replicare murmur2
+                            if (partition != null) perPartition[partition]++;
+                        }
                         perFile++;
                     }
                 }
                 totale += perFile;
-                System.out.printf("  %-30s -> %,d tick%n",
-                                  giorno.getFileName(), perFile);
+
+                if (planner == null) {
+                    System.out.printf("  %-30s -> %,d tick%n", giorno.getFileName(), perFile);
+                } else if (plan == null) {
+                    // storia insufficiente: ha instradato Kafka, il contatore per partizione
+                    // e' vuoto e stampare un max/mean qui darebbe un 1,00x privo di senso
+                    System.out.printf("  %-30s -> %,d tick   (warmup: hash di default)%n",
+                            giorno.getFileName(), perFile);
+                    planner.endOfDay();
+                } else {
+                    System.out.printf("  %-30s -> %,d tick   max/mean=%.2fx%n",
+                            giorno.getFileName(), perFile,
+                            PartitionPlanner.imbalance(perPartition));
+                    planner.endOfDay();
+                }
             }
 
             long ms = System.currentTimeMillis() - start;

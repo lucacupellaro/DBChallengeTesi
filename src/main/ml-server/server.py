@@ -48,26 +48,40 @@ def health():
     return {"status": "ok"}
 
 
+def _to_log(x, symbol):
+    """rv_daily arriva in LIVELLO (volatilita' giornaliera, es. 0.0145); i modelli
+    lavorano in log. Il campo log_rv invece e' gia' in log e passa inalterato."""
+    x = float(x)
+    if x <= 0 or math.isnan(x) or math.isinf(x):
+        raise HTTPException(status_code=422,
+                            detail=f"rv_daily non positivo o non finito per {symbol}: {x}")
+    return math.log(x)
+
+
 @app.post("/predict")
 def predict(req: PredictRequest):
-    # Accetta sia log_rv che rv_daily (il FlinkJob manda rv_daily)
-    log_rv = req.log_rv if req.log_rv is not None else req.rv_daily
-    if log_rv is None:
+    # Due contratti: log_rv e' gia' in log, rv_daily e' in livello e va trasformato.
+    # Trattare rv_daily come se fosse un log fa arrivare al modello feature ~0, e la
+    # predizione collassa su exp(const) ~ 0,73 per ogni asset e ogni giorno.
+    if req.log_rv is not None:
+        log_rv = float(req.log_rv)
+        if math.isnan(log_rv) or math.isinf(log_rv):
+            logger.warning("log_rv non valido per %s: %.6f", req.symbol, log_rv)
+            raise HTTPException(status_code=422, detail="log_rv contiene NaN o Inf")
+    elif req.rv_daily is not None:
+        log_rv = _to_log(req.rv_daily, req.symbol)
+    else:
         raise HTTPException(status_code=422, detail="Serve log_rv o rv_daily")
-    if math.isnan(log_rv) or math.isinf(log_rv):
-        logger.warning("log_rv non valido per %s: %.6f", req.symbol, log_rv)
-        raise HTTPException(status_code=422, detail="log_rv contiene NaN o Inf")
 
     try:
         # Warmup: se arriva la storia completa, sostituisci il buffer
         # Il FlinkJob può mandare history come lista di triple [d,w,m]: prendi solo d
         if req.history is not None:
+            # la storia arriva nelle stesse unita' del campo usato per il giorno corrente
             parsed = []
             for item in req.history:
-                if isinstance(item, (list, tuple)):
-                    parsed.append(float(item[0]))  # primo elemento = rv_daily
-                else:
-                    parsed.append(float(item))
+                v = float(item[0]) if isinstance(item, (list, tuple)) else float(item)
+                parsed.append(v if req.log_rv is not None else _to_log(v, req.symbol))
             symbol_history[req.symbol] = parsed
         else:
             if req.symbol not in symbol_history:
